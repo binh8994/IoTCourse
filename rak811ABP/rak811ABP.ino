@@ -12,9 +12,12 @@
 #define RXpin         2
 #define LED           13
 #define ONE_WIRE_BUS  4
+#define TURB_ADC      A0
 
 #define SENSOR_TYPE   0
 #define CONTROL_TYPE  1
+
+
 
 struct {
   int8_t msg_type;
@@ -103,7 +106,7 @@ void loop() {
         while (1) {
           sensors.requestTemperatures();
           Lora_msg.temp = (int16_t)(sensors.getTempCByIndex(0) * 100);
-          Lora_msg.turb = (int16_t)(rand());
+          Lora_msg.turb = (int16_t)(analogRead(TURB_ADC) * 5.0 / 10.24);
           DBG.print("Temp: "); DBG.println(Lora_msg.temp);
           DBG.print("Turb: "); DBG.println(Lora_msg.turb);
 
