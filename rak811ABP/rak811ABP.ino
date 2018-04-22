@@ -1,5 +1,6 @@
 
 #include <SoftwareSerial.h>
+#include <Servo.h>
 #include <RAK811.h>
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -11,29 +12,28 @@
 #define TXpin         3
 #define RXpin         2
 #define LED           13
-#define ONE_WIRE_BUS  4
+#define DS18B20_PIN   4
 #define TURB_ADC      A0
-
-#define SENSOR_TYPE   0
-#define CONTROL_TYPE  1
-
-
+#define SERVO         6
+#define PUMP          5
 
 struct {
-  int8_t msg_type;
   int16_t temp;
   int16_t turb;
 } Lora_msg;
 
 SoftwareSerial DBG(RXpin, TXpin);
+Servo myservo;
 RAK811 RAKLoRa(LoraSerial);
-OneWire oneWire(ONE_WIRE_BUS);
+OneWire oneWire(DS18B20_PIN);
 DallasTemperature sensors(&oneWire);
 
 String NwkSKey = "3BF0A70FA7E2A809A7D1A9BCD505797B";
 String AppSKey = "24B4464EA2E2A0FD5227ADA0B13F509B";
 String DevAddr = "26041F84";
-//char* buffer[32];
+
+bool M2_On = false;
+uint32_t M2_on_time;
 
 void setup() {
   DBG.begin(115200);
@@ -42,7 +42,10 @@ void setup() {
   DBG.println("StartUP");
 
   pinMode(LED, OUTPUT);
-  digitalWrite(LED, 0);
+  pinMode(PUMP, OUTPUT);
+  pinMode(SERVO, OUTPUT);
+  digitalWrite(LED, LOW);
+  digitalWrite(PUMP, LOW);
 
   LoraSerial.begin(115200);
   while (!LoraSerial);
@@ -50,7 +53,8 @@ void setup() {
 
   sensors.begin();
 
-  Lora_msg.msg_type = SENSOR_TYPE;
+  pump(false);
+  feed(false);
 }
 
 void loop() {
@@ -81,19 +85,6 @@ void loop() {
         //DBG.println("Set duty");
         RAKLoRa.rk_setConfig("duty", "off");
 
-
-        //          static bool setted = false;
-        //          if( setted == false ) {
-        //            for(int i = 8; i < 63; i++) {
-        //              String index = String(i);
-        //              String value = index + String(",off,0,3");
-        //              RAKLoRa.rk_setConfig("ch_list", value);
-        //              DBG.println(value);
-        //              setted = true;
-        //              delay(500);
-        //            }
-        //          }
-
         //DBG.println("Get retrans: ");
         //DBG.println(RAKLoRa.rk_getConfig("retrans"));
 
@@ -104,17 +95,9 @@ void loop() {
         //DBG.println(RAKLoRa.rk_getConfig("ch_list"));
 
         while (1) {
-          sensors.requestTemperatures();
-          Lora_msg.temp = (int16_t)(sensors.getTempCByIndex(0) * 100);
-          Lora_msg.turb = (int16_t)(analogRead(TURB_ADC) * 5.0 / 10.24);
-          DBG.print("Temp: "); DBG.println(Lora_msg.temp);
-          DBG.print("Turb: "); DBG.println(Lora_msg.turb);
+          readSensors();
+          sendPkt();
 
-          String send_str = String("at+send=0,1,") + arr2hexStr(&Lora_msg, sizeof(Lora_msg));
-          DBG.print("Send Data: ");
-          DBG.println(send_str);
-          LoraSerial.println(send_str);
-          delay(500);
           LoraSerial.setTimeout(2000);
           String recv = LoraSerial.readStringUntil('\n');
           if ( recv.indexOf("OK") != -1 ) {
@@ -132,42 +115,38 @@ void loop() {
                 else if ( (recv.indexOf("=0,1,") != -1) ) {
                   DBG.println("Recv something");
                   String down_link = recv.substring(recv.lastIndexOf(',') + 1);
-                  //DBG.println(down_link.length());
-                  //DBG.println(down_link);
-                  if (down_link.length() == 7) {
-                    if (down_link.startsWith("010000")) {
-                      DBG.println("M1 OFF, M2 OFF");
-                    }
-                    else if (down_link.startsWith("010001")) {
-                      DBG.println("M1 OFF, M2 ON");
-                    }
-                    else if (down_link.startsWith("010100")) {
-                      DBG.println("M1 ON, M2 OFF");
-                    }
-                    else if (down_link.startsWith("010101")) {
-                      DBG.println("M1 ON, M2 ON");
-                    }
-                    else {
-                      DBG.println("Parser err");
-                    }
-                  }
-                  else {
-                    DBG.println("Parser err");
-                  }
-
+                  down_link.remove(down_link.length() - 1);
+                  parserCommand(&down_link);
                 }
               }
+
+              if (M2_On && ((uint32_t)millis() - M2_on_time) > 10000) {
+                M2_On = false;
+                digitalWrite(PUMP, LOW);
+              }
+
             }
           }
           else {
             DBG.println("Send data fail!");
             break;
           }
+
+          if (M2_On && ((uint32_t)millis() - M2_on_time) > 10000) {
+            M2_On = false;
+            digitalWrite(PUMP, LOW);
+          }
+
         }
       }
     }
   }
   delay(1000);
+  
+  if (M2_On && ((uint32_t)millis() - M2_on_time) > 10000) {
+    M2_On = false;
+    digitalWrite(PUMP, LOW);
+  }
 }
 
 String arr2hexStr( void* in, int size_in) {
@@ -178,6 +157,94 @@ String arr2hexStr( void* in, int size_in) {
     ret += tmp;
   }
   return ret;
+}
+
+void readSensors() {
+  sensors.requestTemperatures();
+  Lora_msg.temp = (int16_t)(sensors.getTempCByIndex(0) * 100);  //Temp x 100
+  Lora_msg.turb = (int16_t)(analogRead(TURB_ADC) * 5.0 / 10.24);//Turb x 100
+  DBG.print("Temp: "); DBG.println(Lora_msg.temp);
+  DBG.print("Turb: "); DBG.println(Lora_msg.turb);
+}
+
+void sendPkt() {
+  String send_str = String("at+send=0,1,") + arr2hexStr(&Lora_msg, sizeof(Lora_msg));
+  //DBG.print("Send Data: ");
+  DBG.println(send_str);
+  LoraSerial.println(send_str);
+  delay(500);
+}
+
+void pump(bool cmd) {
+  if (cmd) {
+    if (!M2_On) {
+      M2_On = true;
+      digitalWrite(PUMP, HIGH);
+      M2_on_time = millis();
+    }
+    DBG.println("Pump:ON");
+  }
+  else {
+    if (M2_On) {
+      M2_On = false;
+      digitalWrite(PUMP, LOW);
+    }
+    DBG.println("Pump:OFF");
+  }
+}
+
+void feed(bool cmd) {
+  myservo.attach(SERVO);
+  delay(10);
+  if (cmd) {
+    myservo.write(140);
+    delay(300);
+    myservo.write(150);
+    delay(300);
+    DBG.println("Feed:ON");
+    pinMode(SERVO, INPUT);
+  }
+  else {
+    myservo.write(150);
+    delay(300);
+    DBG.println("Feed:OFF");
+    pinMode(SERVO, INPUT);
+  }
+}
+
+void parserCommand(String* payload) {
+  if (payload->length() != 4) {
+    DBG.println("Length err");
+    return;
+  }
+
+  DBG.println(*payload);
+
+  /*check type cmd:
+    00 -> control pump
+    01 -> control feed
+  */
+  if (payload->startsWith("00")) {
+    if (payload->endsWith("00")) {
+      pump(false);
+    }
+    else if (payload->endsWith("01")) {
+      pump(true);
+    }
+  }
+
+  else if (payload->startsWith("01")) {
+    if (payload->endsWith("01")) {
+      feed(true);
+    }
+    else if (payload->endsWith("01")) {
+      feed(false);
+    }
+  }
+
+  else {
+    DBG.println("Parser err");
+  }
 }
 
 //at+mode=0
